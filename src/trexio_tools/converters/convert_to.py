@@ -2,7 +2,7 @@
 """
 convert output of GAMESS/GAU$$IAN to trexio
 """
-
+pass
 import sys
 import os
 from functools import reduce
@@ -15,22 +15,63 @@ except:
     print("Error: The TREXIO Python library is not installed")
     sys.exit(1)
 
+# Helper method to write binary data with correct endianness, see below
+# Only tested on little-endian machine
+def binary_write_endian(int_file, data):
+    if sys.byteorder == "little":
+        int_file.write(data.tobytes())
+    else:
+        int_file.write(data.byteswap().tobytes())
+
+"""
+Helper method for the converter below. It is used to automatically select
+text / binary output.
+"""
+def fcidump_write(int_file, val, indices, binary):
+    if not binary:
+        print(val, indices[0], indices[1], indices[2], indices[3], file=int_file)
+    if binary:
+        # The data is read as one 64 bit integer, not 4x 16 bit integers
+        # -> Endianness must be respected here as well
+        # Since the file reading in NECI is written in ancient Fortran, each data
+        # point needs its own header and tail
+        header = np.zeros((1), dtype=np.int32)
+        header[0] = 16
+        binary_write_endian(int_file, header)
+        indices = np.array(indices, np.int64)
+        ind_comp = np.zeros((1), dtype=np.int64)
+
+        for i in range(4):
+            ind_comp[0] = ind_comp[0] << 16
+            ind_comp[0] += indices[i]
+
+        val64 = np.zeros((1), dtype=np.float64)
+        val64[0] = val
+        binary_write_endian(int_file, val64)
+        binary_write_endian(int_file, ind_comp)
+        binary_write_endian(int_file, header)
+
 """
 Converter from trexio to fcidump
 Symmetry labels are not included
 
-Written by Johannes Günzl, TU Dresden 2023
-"""
-def run_fcidump(trexfile, filename, spin_order):
-    # The Fortran implementation takes i_start and i_end as arguments; here,
-    # whether an orbital is active is taken from the field in the file
-    # Active orbitals are carried over as-is, core orbitals are incorporated
-    # into the integrals; all others are deleted
+The binary keyword is intended for use with NECI. The Fortran name list
+is written to FCISYM, the integrals are written in binary to the FCIDUMP
+file. The functionality is the same as using a text FCIDUMP, it's just faster.
+For use with NECI, the (undocumented) readbin keyword must be used there.
 
+Written by Johannes Günzl, TU Dresden 2023-24
+"""
+def run_fcidump(trexfile, filename, spin_order="block", binary=False):
     if not spin_order in ["block", "interleave"]:
         raise ValueError("Supported spin_order options: block (default), interleave")
 
-    with open(filename, "w") as ofile:
+    header_filename = filename
+
+    if binary:
+        header_filename = "FCISYM"
+
+    with open(header_filename, "w") as ofile:
         if not trexio.has_mo_num(trexfile):
             raise Exception("The provided trexio file does not include "\
                             "the number of molecular orbitals.")
@@ -39,6 +80,11 @@ def run_fcidump(trexfile, filename, spin_order):
             raise Exception("The provided trexio file does not include "\
                             "the number of electrons.")
         elec_num = trexio.read_electron_num(trexfile)
+
+        if not binary:
+            int_file = ofile
+        else:
+            int_file = open(filename, "wb")
 
         occupation = 2
         ms2 = 0
@@ -50,7 +96,7 @@ def run_fcidump(trexfile, filename, spin_order):
 
         spins = None
         # Used to check the order of spins in UHF files
-        if ms2 != 0 and trexio.has_mo_spin(trexfile):
+        if trexio.has_mo_spin(trexfile):
             spins = trexio.read_mo_spin(trexfile)
 
         if trexio.has_mo_class(trexfile):
@@ -82,19 +128,21 @@ def run_fcidump(trexfile, filename, spin_order):
             raise Exception("Core orbitals are not supported for spin polarized systems")
 
         # Write header
-        print("&FCI", file=ofile, end = " ")
-        print(f"NORB={n_act},", file=ofile, end = " ")
-        print(f"NELEC={elec_num - occupation*n_core},", file=ofile, end = " ")
-        print(f"MS2={ms2},", file=ofile)
-        print("ORBSYM=", end="", file=ofile)
+        header_string = "&FCI "
+        header_string += f"NORB={n_act}, "
+        header_string += f"NELEC={elec_num - occupation*n_core}, "
+        header_string += f"MS2={ms2},\n"
+        header_string += "ORBSYM="
         for i in range(n_act):
             # The symmetry formats between trexio and FCIDUMP differ, so this
             # information is not carried over automatically
-            print("1,", end="", file=ofile)
-        print("\nISYM=1,", end="", file=ofile)
-        if ms2 != 0:
-            print("\nUHF=.TRUE.,", file=ofile)
-        print("\n&END", file=ofile)
+            header_string += "1,"
+        header_string += "\nISYM=1,"
+        if not spins is None and not np.all(spins == spins[0]):
+            header_string += "\nUHF=.TRUE.,"
+        header_string += "\n&END"
+
+        print(header_string, file=ofile)
 
         # Can be used to switch up the indices of printed integrals if necessary
         out_index = np.array([i+1 for i in range(n_act)])
@@ -165,7 +213,7 @@ def run_fcidump(trexfile, filename, spin_order):
 
                     if i >= 0 and j >= 0 and k >= 0 and l >= 0:
                         # Convert from dirac to chemists' notation
-                        print(val, out_index[i], out_index[k], out_index[j], out_index[l], file=ofile)
+                        fcidump_write(int_file, val, (out_index[i], out_index[k], out_index[j], out_index[l]), binary)
 
                     # Since the integrals are added, the multiplicity needs to be screened
                     if not (ii >= kk and ii >= jj and ii >= ll and jj >= ll and (ii != jj or ll >= kk)):
@@ -224,7 +272,7 @@ def run_fcidump(trexfile, filename, spin_order):
                 for b in range(a, n_act):
                     val = int3[a, b, 0]
                     if np.abs(val) > fcidump_threshold:
-                        print(val, out_index[b], out_index[a], 0, 0, file=ofile)
+                        fcidump_write(int_file, val, (out_index[b], out_index[a], 0, 0), binary)
 
         # Core energy
         if trexio.has_nucleus_repulsion(trexfile):
@@ -236,7 +284,10 @@ def run_fcidump(trexfile, filename, spin_order):
                         if orb_ids[j] == -1:
                             core += occupation*int2[i, j, 0] - int2[i, j, 1]
 
-            print(core, 0, 0, 0, 0, file=ofile)
+            fcidump_write(int_file, core, (0, 0, 0, 0), binary)
+
+        if binary:
+            int_file.close()
 
 def run_molden(t, filename):
 
@@ -587,7 +638,6 @@ def run_spherical(t, filename):
     run_cart_phe(t, filename, to_cartesian=0)
     return
 
-
 def run(trexio_filename, filename, filetype, spin_order):
 
     trexio_file = trexio.File(trexio_filename,mode='r',back_end=trexio.TREXIO_AUTO)
@@ -604,6 +654,8 @@ def run(trexio_filename, filename, filetype, spin_order):
 #        run_resultsFile(trexio_file, filename)
     elif filetype.lower() == "fcidump":
         run_fcidump(trexio_file, filename, spin_order)
+    elif filetype.lower() == "neci-fcidump":
+        run_fcidump(trexio_file, filename, "interleave", binary=True)
 #    elif filetype.lower() == "molden":
     else:
         raise NotImplementedError(f"Conversion from TREXIO to {filetype} is not supported.")
