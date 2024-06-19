@@ -9,11 +9,61 @@ from functools import reduce
 from . import cart_sphe as cart_sphe
 import numpy as np
 
+from numpy.linalg import svd
+from scipy.linalg.blas import dgemm
+
 try:
     import trexio
 except:
     print("Error: The TREXIO Python library is not installed")
     sys.exit(1)
+
+"""
+Helper class to store sparse data in a TREXIO file. It serves as a buffer
+when writing i.e. eri values. It is constructed from:
+    - the trexio file to be written to
+    - the write function to be used, e.g. trexio.write_ao_2e_int_eri
+    - a batch size, e.g. 100000
+Note that write_batch is called automatically when the batch is full,
+but must also be called once all data has been served to the class.
+"""
+class SparseData:
+    def __init__(self, trexfile, write_function, batch_size):
+        self.trexfile = trexfile
+        self.write_f = write_function
+        self.batch_offset = 0
+        self.batch_size = batch_size
+
+        self.batch_indices = np.zeros((batch_size, 4), dtype=int)
+        self.batch_vals = np.zeros(batch_size, dtype=float)
+        self.index_in_batch = 0
+
+    def write_batch(self):
+        # Check if there is anything left to flush
+        if self.index_in_batch == 0:
+            return
+
+        self.write_f(self.trexfile, self.batch_offset,
+                     self.index_in_batch, self.batch_indices,
+                     self.batch_vals)
+
+        self.batch_offset += self.index_in_batch
+        self.index_in_batch = 0
+
+    def add(self, indices, val):
+        self.batch_indices[self.index_in_batch] = indices
+        self.batch_vals[self.index_in_batch] = val
+
+        self.index_in_batch += 1
+
+        if self.index_in_batch >= self.batch_size:
+            self.write_batch()
+
+"""
+Helper method to convert a matrix in the ao basis to the mo basis.
+"""
+def ao2mo(matrix, coeffs):
+    return np.einsum("ia,jb,ab", coeffs, coeffs, matrix)
 
 # Helper method to write binary data with correct endianness, see below
 # Only tested on little-endian machine
@@ -69,7 +119,7 @@ def run_fcidump(trexfile, filename, spin_order="block", binary=False):
     header_filename = filename
 
     if binary:
-        header_filename = "FCISYM"
+        header_filename = os.path.join(os.path.dirname(os.path.abspath(filename)), "FCISYM")
 
     with open(header_filename, "w") as ofile:
         if not trexio.has_mo_num(trexfile):
@@ -288,6 +338,168 @@ def run_fcidump(trexfile, filename, spin_order="block", binary=False):
 
         if binary:
             int_file.close()
+
+"""
+Converter to change the given MO-basis to natural orbitals according to the
+1e rdm (spinless). This is basically a port of the same functionality in
+quantum package. The motivation is that, when converting a spherical harmonics
+basis to cartesian AO, the AO integrals get lost. Hence, the QP implementation
+cannot calculate the new MO integrals. This implementation can be used
+with any kind of basis set, though the rdm needs to be calculated by a
+different program and copied to the work file.
+"""
+def run_natural(trexin, outname):
+    eri_threshold = 1e-8
+
+    os.system('cp -r %s %s' % (trexin.filename, outname))
+    out = trexio.File(outname, 'u', trexin.back_end)
+    rdm = trexio.read_rdm_1e(trexin)
+
+    ao_num     = trexio.read_ao_num(trexin)
+    ao_overlap = trexio.read_ao_1e_int_overlap(trexin)
+    mo_coef    = trexio.read_mo_coefficient(trexin)
+    mo_num     = trexio.read_mo_num(trexin)
+    mo_overlap = trexio.read_mo_1e_int_overlap(trexin)
+
+    svd_ret = svd(rdm)
+    u = svd_ret.U
+    mo_occ = svd_ret.S
+
+    accu = 0
+    width = 25
+    print("MO".ljust(5), "Eigenvalue".ljust(width), "Cumulated".ljust(width))
+    for i, o in enumerate(mo_occ):
+        accu += o
+        print(str(i).ljust(5), str(o).ljust(width), str(accu).ljust(width))
+
+    mo_coef = dgemm(1.0, mo_coef.transpose(), u).transpose()
+
+    # Nullify small elements
+    amax = np.max(mo_coef)
+    if np.abs(amax) < 1e-16:
+        raise Exception("Converted coefficient matrix has too small entries")
+
+    mo_coef = np.where(np.abs(mo_coef / amax) < 1e-10, 0, mo_coef)
+
+    # Orthonormalize MO
+    # Exclude almost linearly dependent orbitals
+    # Do I need to update mo_overlap here?
+    mo_overlap = ao2mo(ao_overlap, mo_coef) # TODO: Find out whether this here is correct
+    svd_ret = svd(mo_overlap)
+    d = svd_ret.S
+    u = svd_ret.U
+    vt = svd_ret.Vh
+    local_cutoff = 10e-10 * d[0]
+    mm = mo_num
+    for i in range(mo_num):
+        if d[i] > local_cutoff:
+            d[i] = 1/d[i]
+        else:
+            mm -= 1
+            d[i] = 0
+
+    s = np.zeros(shape=(mo_num, mo_num), dtype=float)
+
+    if mm < mo_num:
+        print(f"Removed linear dependencies below {local_cutoff}")
+
+    for k in range(mo_num):
+        if d[k] != 0:
+            for j in range(mo_num):
+                for i in range(mo_num):
+                    s[j, i] = s[j, i] + u[k, i]*d[k]*vt[j, k]
+
+    mo_coef = dgemm(1.0, mo_coef.transpose(), s).transpose()
+
+    # At this point, MO are sorted by their occupation, not energy
+    # Additional step not in QP: If there is a singly-occupied orbital that 
+    # was frozen during the rdm calculation it is put back where it 
+    # belongs. This requires that the orbitals are hardly shuffled during
+    # the orthonormalization, i.e. said orbital is already quite orthogonal
+
+    # First, check whether such an orbital existed
+    old_occ = trexio.read_mo_occupation(trexin)
+    old_single = -1
+    last_occ = 2
+    is_aufbau = True
+    for i, occ in enumerate(old_occ):
+        if occ == 1 and old_single == -1:
+            old_single = i
+        if occ > last_occ:
+            is_aufbau = False
+        last_occ = occ
+
+    # If we had an aufbau state, that orb is nigh certainly in the right
+    # place anyways
+
+    if not is_aufbau and old_single != -1:
+        frozen_single = -1
+        for i, occ in enumerate(mo_occ):
+            print(i, occ)
+            if np.fabs(occ - 1) < 1e-5: # This threshold is arbitrary
+                frozen_single = i
+                break
+
+        if frozen_single != -1:
+            print("Swapping matrix rows", old_single, frozen_single)
+            # Swap coefficient matrix rows
+            mo_coef[[old_single, frozen_single]] \
+                    = mo_coef[[frozen_single, old_single]]
+
+    # I have the new coefficients, now I just need to apply them
+    ham = trexio.read_ao_1e_int_core_hamiltonian(trexin)
+    trexio.write_mo_1e_int_overlap(out, ao2mo(ao_overlap, mo_coef))
+    trexio.write_mo_1e_int_core_hamiltonian(out, ao2mo(ham, mo_coef))
+    trexio.write_mo_coefficient(out, mo_coef)
+
+    # Two electron tensor needs work
+    # Everything in Dirac convention
+    # First, load the ao tensor
+    ao_eri = np.zeros(shape=(ao_num, ao_num, ao_num, ao_num), dtype=float)
+    offset = 0
+    buffer_size = 10000
+    reading = True
+    while reading:
+        data = trexio.read_ao_2e_int_eri(trexin, offset, buffer_size)
+        reading = not data[3]
+        offset += data[2]
+        for n in range(data[2]):
+            ind = data[0][n]
+            val = data[1][n]
+            i = ind[0]
+            j = ind[1]
+            k = ind[2]
+            l = ind[3]
+            ao_eri[i, j, k, l] = val
+            ao_eri[k, j, i, l] = val
+            ao_eri[k, l, i, j] = val
+            ao_eri[i, l, k, j] = val
+
+            ao_eri[j, i, l, k] = val
+            ao_eri[j, k, l, i] = val
+            ao_eri[l, k, j, i] = val
+            ao_eri[l, i, j, k] = val
+
+    # Now for the actual conversion
+    # We don't want no leftovers
+    trexio.delete_mo_2e_int(out)
+    data = SparseData(out, trexio.write_mo_2e_int_eri, 10000)
+
+    # Outer indices are for MO
+    mo_eri = np.einsum("ia,jb,kc,ld,abcd", mo_coef, mo_coef, mo_coef, mo_coef, \
+            ao_eri, optimize="optimal")
+    
+    for l in range(mo_num):
+        for k in range(mo_num):
+            for j in range(l, mo_num):
+                for i in range(max(j, k), mo_num):
+                    if i == j and k > l: continue
+                    val = mo_eri[i, j, k, l]
+                    if np.abs(val) > eri_threshold:
+                        data.add([i, j, k, l], val)
+    data.write_batch()
+
+    out.close()
 
 def run_molden(t, filename):
 
@@ -656,6 +868,8 @@ def run(trexio_filename, filename, filetype, spin_order):
         run_fcidump(trexio_file, filename, spin_order)
     elif filetype.lower() == "neci-fcidump":
         run_fcidump(trexio_file, filename, "interleave", binary=True)
+    elif filetype.lower() == "natural":
+        run_natural(trexio_file, filename)
 #    elif filetype.lower() == "molden":
     else:
         raise NotImplementedError(f"Conversion from TREXIO to {filetype} is not supported.")
