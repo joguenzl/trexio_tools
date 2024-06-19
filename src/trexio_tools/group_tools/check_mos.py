@@ -69,11 +69,14 @@ except ImportError:
         the matrix stored in the file.
         """
 
+        if trexio.read_basis_type(trexio_file) == "Numerical":
+            from . import nao as trexio_ao
+
         mo = trexio_mo.read(trexio_file)
         ao = mo["ao"]
         basis = ao["basis"]
         nucleus = basis["nucleus"]
-        assert basis["type"] == "Gaussian"
+        assert basis["type"] == "Gaussian" or basis["type"] == "Numerical"
 
         rmin = np.array( list([ np.min(nucleus["coord"][:,a]) for a in range(3) ]) )
         rmax = np.array( list([ np.max(nucleus["coord"][:,a]) for a in range(3) ]) )
@@ -97,15 +100,20 @@ except ImportError:
                S += np.outer(chi, chi)*dv
         print()
 
-        S_ex = np.eye(mo_num)
+        if trexio.has_mo_1e_int_overlap(trexio_file):
+            S_ex = trexio.read_mo_1e_int_overlap(trexio_file)
+        else:
+            S_ex = np.eye(mo_num)
         S_diff = S - S_ex
-        print ("%e %e"%(np.linalg.norm(S), np.linalg.norm(S_ex) ))
-        print ("Norm of the error: %e"%(np.linalg.norm(S_diff)))
-        #print(S_diff)
 
         for i in range(mo_num):
           for j in range(i,mo_num):
             print("%3d %3d %15f %15f"%(i,j,S[i][j],S_ex[i,j]))
 
+        print ("%e %e"%(np.linalg.norm(S), np.linalg.norm(S_ex) ))
+        print ("Norm of the error: %e"%(np.linalg.norm(S_diff)))
+        #print(S_diff)
 
-
+        print("Diagonal entries:")
+        for i in range(mo_num):
+            print("%3d %15f"%(i,S[i][i]))

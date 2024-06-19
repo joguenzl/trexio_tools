@@ -3,6 +3,7 @@
 import trexio
 import numpy as np
 from . import basis as trexio_basis
+from . import nao as trexio_nao
 
 def read(trexio_file):
     r = {}

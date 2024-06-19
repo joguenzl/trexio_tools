@@ -3,11 +3,16 @@
 import trexio
 import numpy as np
 from . import ao as trexio_ao
+from . import nao as trexio_nao
 
 def read(trexio_file):
     r = {}
 
-    r["ao"]     = trexio_ao.read(trexio_file)
+    r["type"] = trexio.read_basis_type(trexio_file)
+    if r["type"] == "Numerical":
+        r["ao"]     = trexio_nao.read(trexio_file)
+    else:
+        r["ao"]     = trexio_ao.read(trexio_file)
     r["num"]    = trexio.read_mo_num(trexio_file)
     r["coefficient"]  = trexio.read_mo_coefficient(trexio_file)
 
@@ -29,6 +34,9 @@ def value(mo, r):
     """
 
     ao = mo["ao"]
-    ao_value = trexio_ao.value(ao, r)
+    if mo["type"] == "Numerical":
+        ao_value = trexio_nao.value(ao, r)
+    else:
+        ao_value = trexio_ao.value(ao, r)
     coef = mo["coefficient"]
     return coef @ ao_value

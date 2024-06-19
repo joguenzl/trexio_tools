@@ -81,7 +81,6 @@ except ImportError:
             "One-electron overlap integrals are missing in the TREXIO file. Required for check-basis."
             )
 
-        print(trexio.read_basis_type(trexio_file))
         if trexio.read_basis_type(trexio_file) == "Numerical":
             from . import nao as trexio_ao
         ao = trexio_ao.read(trexio_file)
